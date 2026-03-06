@@ -1,0 +1,108 @@
+# Dockerfile.operator — Multi-stage build for Operator Repo
+# Optimized for Operator-OS: embedded SQLite, minimal Alpine, no frontend bloat
+
+# ============================================================
+# Stage 1: Build the Go binary
+# ============================================================
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache \
+    build-base \
+    git \
+    make \
+    gcc \
+    musl-dev \
+    sqlite-dev
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Build with SQLite, strip debug symbols, disable CGo-free mode
+# Tags: sqlite = embedded database, bindata = embedded assets
+RUN CGO_ENABLED=1 go build \
+    -tags "sqlite sqlite_unlock_notify bindata" \
+    -ldflags="-s -w -X 'main.Version=operator-dev' -X 'main.Tags=sqlite,sqlite_unlock_notify,bindata'" \
+    -trimpath \
+    -o /out/gitea .
+
+# ============================================================
+# Stage 2: Minimal runtime image
+# ============================================================
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    git \
+    sqlite \
+    tzdata \
+    && addgroup -S operator \
+    && adduser -S -G operator -h /data -s /bin/sh operator
+
+# Labels
+LABEL org.opencontainers.image.title="Operator Repo" \
+      org.opencontainers.image.description="Lightweight Git service for Operator-OS AI agents" \
+      org.opencontainers.image.source="https://github.com/operatoronline/go-repo" \
+      org.opencontainers.image.vendor="Operator Online" \
+      org.opencontainers.image.licenses="MIT"
+
+# Copy binary from builder
+COPY --from=builder /out/gitea /usr/local/bin/gitea
+
+# Create required directories
+RUN mkdir -p /data/git /data/db /etc/operator-repo \
+    && chown -R operator:operator /data /etc/operator-repo
+
+# ============================================================
+# Environment Variables
+# ============================================================
+
+# Server
+ENV GITEA_WORK_DIR=/data
+ENV GITEA_CUSTOM=/etc/operator-repo
+
+# Operator-OS specific
+ENV OPERATOR_DATA_DIR=/data
+ENV OPERATOR_DB_PATH=/data/db/operator-repo.db
+ENV OPERATOR_LISTEN_ADDR=0.0.0.0
+ENV OPERATOR_LISTEN_PORT=3000
+ENV OPERATOR_DEFAULT_TIER=standard
+ENV OPERATOR_LOG_LEVEL=info
+ENV OPERATOR_ENABLE_WEB_UI=false
+ENV OPERATOR_ENABLE_SSH=false
+
+# Database (embedded SQLite)
+ENV GITEA__database__DB_TYPE=sqlite3
+ENV GITEA__database__PATH=/data/db/gitea.db
+
+# Disable unnecessary features
+ENV GITEA__service__DISABLE_REGISTRATION=true
+ENV GITEA__service__REQUIRE_SIGNIN_VIEW=true
+ENV GITEA__mailer__ENABLED=false
+ENV GITEA__packages__ENABLED=false
+ENV GITEA__actions__ENABLED=false
+ENV GITEA__oauth2__ENABLED=false
+
+# ============================================================
+# Volumes & Ports
+# ============================================================
+VOLUME ["/data"]
+EXPOSE 3000
+
+# ============================================================
+# Health Check
+# ============================================================
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:3000/api/v1/version || exit 1
+
+# ============================================================
+# Run
+# ============================================================
+USER operator
+WORKDIR /data
+
+ENTRYPOINT ["/usr/local/bin/gitea"]
+CMD ["web", "--config", "/etc/operator-repo/app.ini"]
